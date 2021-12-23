@@ -139,6 +139,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
+	rf.lastHeartBeat = time.Now()
 }
 
 // AppendEntriesArgs
@@ -212,7 +213,7 @@ func (rf *Raft) run() {
 		} else { // follower or candidate
 			// 150-300 ms
 			electionTimeout := int64(rand.Intn(150) + 150)
-			if time.Since(rf.lastHeartBeat).Milliseconds() > electionTimeout { // convert to candidate
+			if time.Since(rf.lastHeartBeat).Nanoseconds()/1e6 > electionTimeout { // convert to candidate
 				rf.mu.Lock()
 				rf.leaderId = -1              // reset the lead
 				rf.currentTerm += 1           // increment current term
@@ -242,6 +243,7 @@ func (rf *Raft) run() {
 				}
 				if beOK*2 > len(rf.peers) {
 					rf.leaderId = rf.me
+					D("%d(term=%d) become leader, has vote %d\n", rf.me, rf.currentTerm, beOK)
 					go rf.heartBeat(50 * time.Millisecond)
 				}
 			}
@@ -274,6 +276,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
+	rf.leaderId = -1 // if leader, stop the heart beat
 	rf.isRunning = false
 }
 
