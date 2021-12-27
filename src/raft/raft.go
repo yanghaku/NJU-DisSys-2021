@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"math/rand"
 	"sync"
 	"time"
@@ -85,6 +87,7 @@ func (rf *Raft) timerRandomReset() {
 func (rf *Raft) applyCommits(applyEnd int) {
 	var apply ApplyMsg
 	rf.mu.Lock()
+	go rf.persist()
 	for rf.lastApplied < applyEnd { // get apply entry
 		rf.lastApplied += 1
 		apply.Index = rf.lastApplied
@@ -107,26 +110,29 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //9
 func (rf *Raft) persist() {
-	// Your code here.
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	_ = e.Encode(rf.currentTerm)
+	_ = e.Encode(rf.votedFor)
+	_ = e.Encode(rf.log)
+	rf.persister.SaveRaftState(w.Bytes())
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here.
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	if data != nil {
+		d := gob.NewDecoder(bytes.NewBuffer(data))
+		_ = d.Decode(&rf.currentTerm)
+		_ = d.Decode(&rf.votedFor)
+		_ = d.Decode(&rf.log)
+	} else {
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		rf.log = make([]LogEntry, 1) // the first index of log is 1
+		rf.log[0] = LogEntry{Term: -1, Command: nil}
+	}
 }
 
 // RequestVoteArgs invoked by candidates to gather votes
@@ -301,8 +307,7 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 					LeaderId: rf.me, Term: thisTerm, LeaderCommit: rf.commitIndex}
 				rf.mu.Unlock()
 
-				if !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, just return false
-					break
+				for !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
 				}
 
 				if reply.Term > rf.currentTerm || rf.leaderId != rf.me { // if other response term > currentTerm, convert to follower
@@ -424,12 +429,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	rf.applyMsg = applyCh
-	rf.currentTerm = 0
-	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.log = make([]LogEntry, 1) // the first index of log is 1
-	rf.log[0] = LogEntry{Term: -1, Command: nil}
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.leaderId = -1
