@@ -31,6 +31,7 @@ const heartBeatInterval = 50 * time.Millisecond
 const RPCTimeOut = 200 * time.Millisecond
 const rangeTimeOutL = 150
 const rangeTimeOutR = 300
+const networkFailRetryTimes = 25
 
 func Min(a int, b int) int { // helper function
 	if a > b {
@@ -307,7 +308,12 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 					LeaderId: rf.me, Term: thisTerm, LeaderCommit: rf.commitIndex}
 				rf.mu.Unlock()
 
-				for !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
+				retryTimes := networkFailRetryTimes
+				retryWaitTime := time.Nanosecond
+				for retryTimes >= 0 && !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
+					retryTimes -= 1
+					retryWaitTime <<= 1
+					time.Sleep(retryWaitTime)
 				}
 
 				if reply.Term > rf.currentTerm || rf.leaderId != rf.me { // if other response term > currentTerm, convert to follower
