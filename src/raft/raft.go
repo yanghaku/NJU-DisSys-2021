@@ -28,17 +28,10 @@ import "labrpc"
 
 // global timeout config
 const heartBeatInterval = 50 * time.Millisecond
-const RPCTimeOut = 200 * time.Millisecond
-const rangeTimeOutL = 150
-const rangeTimeOutR = 300
+const RPCTimeOut = time.Second
+const rangeTimeOutL = 250
+const rangeTimeOutR = 500
 const networkFailRetryTimes = 25
-
-func Min(a int, b int) int { // helper function
-	if a > b {
-		return b
-	}
-	return a
-}
 
 // ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
@@ -109,7 +102,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//9
+//
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
@@ -119,9 +112,7 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(w.Bytes())
 }
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data != nil {
 		d := gob.NewDecoder(bytes.NewBuffer(data))
@@ -267,13 +258,23 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.log[args.PrevLogIndex] = args.Entries[entryId] // replace old log item
 			entryId++
 		}
+		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex-1].Term > rf.log[args.PrevLogIndex].Term {
+			rf.log = rf.log[:args.PrevLogIndex] // remove the old entry
+		}
 		for ; entryId < len(args.Entries); entryId++ {
 			rf.log = append(rf.log, args.Entries[entryId]) // append the new item
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex { // update commit index, and match
-		rf.commitIndex = Min(args.LeaderCommit, len(rf.log)-1)
-		go rf.applyCommits(rf.commitIndex) // apply these commits
+		newCommitIndex := args.LeaderCommit
+		if newCommitIndex > len(rf.log)-1 { // not more than rf.log length
+			newCommitIndex = len(rf.log) - 1
+			reply.Success = false // if now log is less, return false to fetch new logs
+		}
+		if newCommitIndex != rf.commitIndex { // if commit index changed, apply it
+			rf.commitIndex = newCommitIndex
+			go rf.applyCommits(newCommitIndex) // apply these commits
+		}
 	}
 }
 
@@ -293,15 +294,20 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 		go func(serverId int, logEnd int) { // send
 			reply := &AppendEntriesReply{Success: false}
 			var sendEntries []LogEntry = nil
+			sendRollBack := 1 // if it doesn't matched, must decrement
 			for {
 				rf.mu.Lock()
-				prevLogIndex := rf.nextIndex[serverId] - 1
+				prevLogIndex := rf.nextIndex[serverId] - sendRollBack
+				if prevLogIndex < 0 { // prevLogIndex must >=0
+					prevLogIndex = 0
+				}
+				next := prevLogIndex + 1
+				if rf.leaderId != rf.me || (logEnd != -1 && next >= logEnd) {
+					rf.mu.Unlock()
+					break
+				}
 				if logEnd != -1 { // not heart beat
-					if rf.leaderId != rf.me || rf.nextIndex[serverId] >= logEnd { // if other goroutine has sent, just return
-						rf.mu.Unlock()
-						break
-					}
-					sendEntries = rf.log[rf.nextIndex[serverId]:logEnd]
+					sendEntries = rf.log[next:logEnd]
 				}
 				args := AppendEntriesArgs{Entries: sendEntries,
 					PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[prevLogIndex].Term,
@@ -310,17 +316,20 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 
 				retryTimes := networkFailRetryTimes
 				retryWaitTime := time.Nanosecond
-				for retryTimes >= 0 && !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
+				for rf.leaderId == rf.me && retryTimes >= 0 && !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
 					retryTimes -= 1
 					retryWaitTime <<= 1
 					time.Sleep(retryWaitTime)
 				}
 
-				if reply.Term > rf.currentTerm || rf.leaderId != rf.me { // if other response term > currentTerm, convert to follower
+				if reply.Term > thisTerm || rf.leaderId != rf.me { // if other response term > currentTerm, convert to follower
 					rf.mu.Lock()
 					rf.leaderId = -1
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
+					if reply.Term > rf.currentTerm { // if Term changed, reset the voteFor
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+					}
+					reply.Success = false
 					rf.timerRandomReset()
 					rf.mu.Unlock()
 					break
@@ -336,12 +345,8 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 					}
 					break
 				} else { // fail, but it does not because RPC, (maybe because of not match)
-					rf.mu.Lock()
-					logEnd = len(rf.log)            // the logEnd may be -1 (heart beat), if fail, we update the logEnd too.
-					if rf.nextIndex[serverId] > 1 { // decrement, but must >=1
-						rf.nextIndex[serverId] -= 1
-					}
-					rf.mu.Unlock()
+					logEnd = len(rf.log)       // the logEnd may be -1 (heart beat), if fail, we update the logEnd too.
+					sendRollBack = len(rf.log) // decrement, doubled
 				}
 			}
 			appendResult <- reply.Success
