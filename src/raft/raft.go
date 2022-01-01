@@ -27,11 +27,13 @@ import (
 import "labrpc"
 
 // global timeout config
-const heartBeatInterval = 50 * time.Millisecond
+const heartBeatInterval = 100 * time.Millisecond
+const electionTimeout = 300 * time.Millisecond
 const RPCTimeOut = time.Second
-const rangeTimeOutL = 250
-const rangeTimeOutR = 500
-const networkFailRetryTimes = 25
+const rangeTimeOutL = 300
+const rangeTimeOutR = 600
+const networkFailRetryTimes = 20
+const ChannelBufSize = 1000
 
 // ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
@@ -65,23 +67,25 @@ type Raft struct {
 	lastApplied        int           // index of the highest log entry applied to state machine
 	nextIndex          []int         // (for leaders) save each server's index of the next log entry to send
 	matchIndex         []int         // (for leaders) save each server's index of the highest log entry known to be replicated
+	lastSend           int           // (for leaders) last index to send AppendEntries to followers
 	applyMsg           chan ApplyMsg // if committed, send msg to it
 	leaderId           int           // the leader's id
-	waitHeartBeatTimer *time.Timer   // wait for heart beat timer, if timeout, become candidate
-	sendHeartBeatTimer *time.Timer   // (for leaders), if timeout, send headBeat
+	waitHeartBeatTimer chan bool     // wait for heart beat timer, if timeout, become candidate
 	isKilled           chan bool
 }
 
-func (rf *Raft) timerRandomReset() {
-	timeout := int64(rand.Intn(rangeTimeOutR-rangeTimeOutL) + rangeTimeOutR)
-	rf.waitHeartBeatTimer.Reset(time.Duration(timeout * int64(time.Millisecond)))
+func (rf *Raft) isLeader() bool {
+	rf.mu.Lock()
+	isLead := rf.me == rf.leaderId
+	rf.mu.Unlock()
+	return isLead
 }
 
 // applyCommits apply from rf.lastApplied + 1 to applyEnd (include applyEnd)
 func (rf *Raft) applyCommits(applyEnd int) {
 	var apply ApplyMsg
 	rf.mu.Lock()
-	go rf.persist()
+	rf.persist()
 	for rf.lastApplied < applyEnd { // get apply entry
 		rf.lastApplied += 1
 		apply.Index = rf.lastApplied
@@ -161,7 +165,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if reply.VoteGranted { // if vote granted, reset the timer
 		rf.votedFor = args.CandidateId
-		rf.timerRandomReset()
+		rf.waitHeartBeatTimer <- false
 	}
 	rf.mu.Unlock() // defer is a little slower than normal operation
 }
@@ -169,11 +173,11 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 // sendRequestVote become candidate, and send RequestVote RPC to all others, result will save to voteResult (only use for follower!!)
 // return true if the candidate become leader
 func (rf *Raft) sendRequestVote() bool {
-	rf.mu.Lock()          // conversion stage (convert to candidate)
-	rf.leaderId = -1      // reset the lead
-	rf.currentTerm += 1   // increment current term
-	rf.votedFor = -1      // vote for reset (not for self to efficient
-	rf.timerRandomReset() // reset election timer
+	rf.mu.Lock()                   // conversion stage (convert to candidate)
+	rf.leaderId = -1               // reset the lead
+	rf.currentTerm += 1            // increment current term
+	rf.votedFor = -1               // vote for reset (not for self to efficient
+	rf.waitHeartBeatTimer <- false // reset election timer
 	lastLogIndex := len(rf.log) - 1
 	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: lastLogIndex, LastLogTerm: rf.log[lastLogIndex].Term}
 	rf.mu.Unlock()
@@ -182,7 +186,7 @@ func (rf *Raft) sendRequestVote() bool {
 	for i := 0; i < voteAllNum; i++ { // send request vote rpc to all servers
 		go func(serverId int) {
 			reply := &RequestVoteReply{VoteGranted: false}
-			if rf.leaderId == -1 && args.Term == rf.currentTerm && rf.peers[serverId].Call("Raft.RequestVote", args, reply) {
+			if rf.peers[serverId].Call("Raft.RequestVote", args, reply) {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm { // change to new term and become follower
 					rf.currentTerm = reply.Term
@@ -204,10 +208,10 @@ func (rf *Raft) sendRequestVote() bool {
 			} else {
 				voteNotGrantedNum += 2
 			}
-			if voteGrantedNum > voteAllNum || voteNotGrantedNum > voteAllNum || rf.leaderId != -1 { // stop early
+			if voteGrantedNum > voteAllNum || voteNotGrantedNum > voteAllNum { // stop early
 				break
 			}
-		case <-time.After(RPCTimeOut): // set RPC timeout to avoid RPC spending too long time
+		case <-time.After(electionTimeout): // set RPC timeout to avoid RPC spending too long time
 			break
 		}
 	}
@@ -232,7 +236,7 @@ type AppendEntriesReply struct {
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.timerRandomReset()
+	rf.waitHeartBeatTimer <- false
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -278,17 +282,21 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 }
 
-// sendAppendEntries send the updated log entries to others, if updateEnd==-1, send heart beat only
-func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update the commitId=updateEnd-1
-	rf.sendHeartBeatTimer.Reset(heartBeatInterval)
+// sendAppendEntries send the updated log entries to others, the heartbeat also contains entries
+func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId=updateEnd-1
+	rf.mu.Lock()
+	updateEnd := len(rf.log)
+	isHeartBeat := updateEnd == rf.lastSend // if lastSend==len(rf.log), just send heartbeat
+	rf.lastSend = updateEnd
+	thisTerm := rf.currentTerm
+	rf.mu.Unlock()
 	appendAllNum := len(rf.peers)
 	appendResult := make(chan bool, appendAllNum)
-	thisTerm := rf.currentTerm
 
 	for i := 0; i < appendAllNum; i++ { // send to every peers
 		if i == rf.me { // don't send to itself, just accept
 			appendResult <- true
-			rf.timerRandomReset()
+			rf.waitHeartBeatTimer <- false
 			continue
 		}
 		go func(serverId int, logEnd int) { // send
@@ -297,16 +305,16 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 			sendRollBack := 1 // if it doesn't matched, must decrement
 			for {
 				rf.mu.Lock()
+				if rf.leaderId != rf.me {
+					rf.mu.Unlock()
+					break
+				}
 				prevLogIndex := rf.nextIndex[serverId] - sendRollBack
 				if prevLogIndex < 0 { // prevLogIndex must >=0
 					prevLogIndex = 0
 				}
 				next := prevLogIndex + 1
-				if rf.leaderId != rf.me || (logEnd != -1 && next >= logEnd) {
-					rf.mu.Unlock()
-					break
-				}
-				if logEnd != -1 { // not heart beat
+				if next < logEnd { // not heart beat
 					sendEntries = rf.log[next:logEnd]
 				}
 				args := AppendEntriesArgs{Entries: sendEntries,
@@ -316,26 +324,27 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 
 				retryTimes := networkFailRetryTimes
 				retryWaitTime := time.Nanosecond
-				for rf.leaderId == rf.me && retryTimes >= 0 && !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
+				for retryTimes >= 0 && rf.isLeader() && !rf.peers[serverId].Call("Raft.AppendEntries", args, reply) { // if rpc fail, retry
 					retryTimes -= 1
 					retryWaitTime <<= 1
 					time.Sleep(retryWaitTime)
 				}
 
-				if reply.Term > thisTerm || rf.leaderId != rf.me { // if other response term > currentTerm, convert to follower
+				if reply.Term > thisTerm { // if other response term > currentTerm, convert to follower
 					rf.mu.Lock()
-					rf.leaderId = -1
-					if reply.Term > rf.currentTerm { // if Term changed, reset the voteFor
-						rf.currentTerm = reply.Term
-						rf.votedFor = -1
+					if rf.leaderId == rf.me {
+						rf.leaderId = -1
+						if reply.Term > rf.currentTerm { // if Term changed, reset the voteFor
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+						}
 					}
-					reply.Success = false
-					rf.timerRandomReset()
 					rf.mu.Unlock()
+					reply.Success = false
 					break
 				}
 				if reply.Success { // success
-					if logEnd != -1 { // if not heart beat
+					if next < logEnd { // if not heart beat
 						rf.mu.Lock()
 						if rf.nextIndex[serverId] < logEnd-1 { // update next index and match index
 							rf.nextIndex[serverId] = logEnd - 1
@@ -345,8 +354,7 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 					}
 					break
 				} else { // fail, but it does not because RPC, (maybe because of not match)
-					logEnd = len(rf.log)       // the logEnd may be -1 (heart beat), if fail, we update the logEnd too.
-					sendRollBack = len(rf.log) // decrement, doubled
+					sendRollBack = logEnd // decrement, doubled
 				}
 			}
 			appendResult <- reply.Success
@@ -355,18 +363,18 @@ func (rf *Raft) sendAppendEntries(updateEnd int) { // if majority accept, update
 
 	// wait for result
 	replyOk := 0
-	for i := 0; i < appendAllNum && rf.leaderId == rf.me; i++ {
+	for i := 0; i < appendAllNum; i++ {
 		select { // wait for send results
 		case r := <-appendResult:
-			if updateEnd == -1 && i > 1 { // heart beat
+			if isHeartBeat && i > 1 { // heart beat
 				return
 			}
-			if updateEnd != -1 && r { // not heart beat
+			if !isHeartBeat && r { // not heart beat
 				replyOk += 2
 				if replyOk > appendAllNum { // if the majority of servers accept, commit it
 					newCommitIndex := updateEnd - 1
 					rf.mu.Lock()
-					if newCommitIndex > rf.commitIndex {
+					if rf.leaderId == rf.me && newCommitIndex > rf.commitIndex && rf.log[newCommitIndex].Term == rf.currentTerm { // for fig 8
 						rf.commitIndex = newCommitIndex
 						go rf.applyCommits(newCommitIndex) // apply these commits
 					}
@@ -408,7 +416,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		index = len(rf.log)
 		rf.log = append(rf.log, LogEntry{Term: term, Command: command}) // save log to logEntries
-		go rf.sendAppendEntries(len(rf.log))                            // send this logEntry to others, and commit
 	}
 	return index, term, isLeader // return immediately
 }
@@ -445,9 +452,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.leaderId = -1
-	rf.waitHeartBeatTimer = time.NewTimer(time.Second)
-	rf.sendHeartBeatTimer = time.NewTimer(0)
-	rf.timerRandomReset()
+	rf.waitHeartBeatTimer = make(chan bool, ChannelBufSize)
+	rf.waitHeartBeatTimer <- false
 	rf.isKilled = make(chan bool)
 	if rf.me == 0 { // set random seed only once
 		rand.Seed(time.Now().UnixNano())
@@ -458,31 +464,33 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	go func() { // main goroutine
 		for {
-			if rf.leaderId == rf.me { // leader
+			if rf.isLeader() { // leader
 				select {
 				case <-rf.isKilled: // if is killed, stop the main goroutine
 					return
-				case <-rf.sendHeartBeatTimer.C: // leader only wait sendHeartBeatTimer, if timeout, send heartBeat
-					go rf.sendAppendEntries(-1) // if timeout, send heartbeat
+				case <-time.After(heartBeatInterval): // leader only wait sendHeartBeatTimer, if timeout, send heartBeat
+					go rf.sendAppendEntries() // if timeout, send heartbeat
 				}
 			} else { // follower or candidate
 				select {
 				case <-rf.isKilled: // if is killed, stop the main goroutine
 					return
-				case <-rf.waitHeartBeatTimer.C: // follower only wait waitHeartBeatTimer, if timeout, become candidate
+				case <-time.After(time.Duration(int64(rand.Intn(rangeTimeOutR-rangeTimeOutL)+rangeTimeOutR)) * time.Millisecond):
 					// timeout! process conversion stage to convert to candidate, and send requestVotes, try to become leader
 					becomeLeader := rf.sendRequestVote()
+					rf.mu.Lock()
 					if becomeLeader && rf.leaderId == -1 { // become leader
-						rf.mu.Lock()
 						rf.leaderId = rf.me
 						lastLogIndex := len(rf.log)
+						rf.lastSend = lastLogIndex
 						for i := range rf.nextIndex { // reinitialized after election
 							rf.nextIndex[i] = lastLogIndex
 							rf.matchIndex[i] = 0
 						}
-						rf.mu.Unlock()
-						go rf.sendAppendEntries(-1) // send heart beat immediately
+						go rf.sendAppendEntries() // send heart beat immediately
 					}
+					rf.mu.Unlock()
+				case <-rf.waitHeartBeatTimer: // do nothing
 				}
 			}
 		}
