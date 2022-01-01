@@ -354,7 +354,7 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 					}
 					break
 				} else { // fail, but it does not because RPC, (maybe because of not match)
-					sendRollBack = logEnd // decrement, doubled
+					sendRollBack <<= 3
 				}
 			}
 			appendResult <- reply.Success
