@@ -309,13 +309,11 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 					rf.mu.Unlock()
 					break
 				}
-				prevLogIndex := rf.nextIndex[serverId] - sendRollBack
-				if prevLogIndex < 0 { // prevLogIndex must >=0
-					prevLogIndex = 0
-				}
+				prevLogIndex := rf.nextIndex[serverId] - 1
 				next := prevLogIndex + 1
 				if next < logEnd { // not heart beat
-					sendEntries = rf.log[next:logEnd]
+					sendEntries = make([]LogEntry, logEnd-next)
+					copy(sendEntries, rf.log[next:logEnd]) // deep copy to avoid data race in RPC
 				}
 				args := AppendEntriesArgs{Entries: sendEntries,
 					PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[prevLogIndex].Term,
@@ -354,7 +352,14 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 					}
 					break
 				} else { // fail, but it does not because RPC, (maybe because of not match)
-					sendRollBack <<= 3
+					sendRollBack <<= 4
+					rf.mu.Lock()
+					rf.nextIndex[serverId] -= sendRollBack
+					if rf.nextIndex[serverId] < 1 { // nextIndex must >= 1
+						rf.nextIndex[serverId] = 1
+					}
+					rf.lastSend = rf.nextIndex[serverId] // avoid next is heart beat
+					rf.mu.Unlock()
 				}
 			}
 			appendResult <- reply.Success
