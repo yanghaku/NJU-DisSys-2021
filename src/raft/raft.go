@@ -1,3 +1,6 @@
+// Copyright 2021-2022 Bo Yang <bo.yang@smail.nju.edu.cn>
+//
+
 package raft
 
 //
@@ -85,7 +88,6 @@ func (rf *Raft) isLeader() bool {
 func (rf *Raft) applyCommits(applyEnd int) {
 	var apply ApplyMsg
 	rf.mu.Lock()
-	rf.persist()
 	for rf.lastApplied < applyEnd { // get apply entry
 		rf.lastApplied += 1
 		apply.Index = rf.lastApplied
@@ -166,6 +168,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if reply.VoteGranted { // if vote granted, reset the timer
 		rf.votedFor = args.CandidateId
 		rf.waitHeartBeatTimer <- false
+		rf.persist()
 	}
 	rf.mu.Unlock() // defer is a little slower than normal operation
 }
@@ -268,6 +271,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		for ; entryId < len(args.Entries); entryId++ {
 			rf.log = append(rf.log, args.Entries[entryId]) // append the new item
 		}
+		rf.persist()
 	}
 	if args.LeaderCommit > rf.commitIndex { // update commit index, and match
 		newCommitIndex := args.LeaderCommit
@@ -421,6 +425,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		index = len(rf.log)
 		rf.log = append(rf.log, LogEntry{Term: term, Command: command}) // save log to logEntries
+		rf.persist()
 	}
 	return index, term, isLeader // return immediately
 }
