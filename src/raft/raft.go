@@ -159,16 +159,18 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.leaderId = -1
 		}
 	}
-	if rf.votedFor == args.CandidateId {
-		reply.VoteGranted = true
-	} else if rf.votedFor == -1 {
-		lastIndex := len(rf.log) - 1 // check safety (more update-to-date)
-		reply.VoteGranted = args.LastLogTerm > rf.log[lastIndex].Term || (args.LastLogTerm == rf.log[lastIndex].Term && args.LastLogIndex >= lastIndex)
-	}
-	if reply.VoteGranted { // if vote granted, reset the timer
-		rf.votedFor = args.CandidateId
-		rf.waitHeartBeatTimer <- false
-		rf.persist()
+	if args.Term == rf.currentTerm {
+		if rf.votedFor == args.CandidateId {
+			reply.VoteGranted = true
+		} else if rf.votedFor == -1 {
+			lastIndex := len(rf.log) - 1 // check safety (more update-to-date)
+			reply.VoteGranted = args.LastLogTerm > rf.log[lastIndex].Term || (args.LastLogTerm == rf.log[lastIndex].Term && args.LastLogIndex >= lastIndex)
+		}
+		if reply.VoteGranted { // if vote granted, reset the timer
+			rf.votedFor = args.CandidateId
+			rf.waitHeartBeatTimer <- false
+			rf.persist()
+		}
 	}
 	rf.mu.Unlock() // defer is a little slower than normal operation
 }
@@ -196,6 +198,8 @@ func (rf *Raft) sendRequestVote() bool {
 					rf.votedFor = -1 // if term changed, the voteFor must reset
 				}
 				rf.mu.Unlock()
+			} else {
+				reply.VoteGranted = false
 			}
 			voteResult <- reply.VoteGranted // send result to the chan
 		}(i)
@@ -278,8 +282,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		if newCommitIndex > len(rf.log)-1 { // not more than rf.log length
 			newCommitIndex = len(rf.log) - 1
 			reply.Success = false // if now log is less, return false to fetch new logs
-		}
-		if newCommitIndex != rf.commitIndex { // if commit index changed, apply it
+		} else if newCommitIndex != rf.commitIndex { // if commit index changed, apply it
 			rf.commitIndex = newCommitIndex
 			go rf.applyCommits(newCommitIndex) // apply these commits
 		}
@@ -303,7 +306,7 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 			rf.waitHeartBeatTimer <- false
 			continue
 		}
-		go func(serverId int, logEnd int) { // send
+		go func(serverId int) { // send
 			reply := &AppendEntriesReply{Success: false}
 			var sendEntries []LogEntry = nil
 			sendRollBack := 1 // if it doesn't matched, must decrement
@@ -315,6 +318,7 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 				}
 				prevLogIndex := rf.nextIndex[serverId] - 1
 				next := prevLogIndex + 1
+				logEnd := len(rf.log)
 				if next < logEnd { // not heart beat
 					sendEntries = make([]LogEntry, logEnd-next)
 					copy(sendEntries, rf.log[next:logEnd]) // deep copy to avoid data race in RPC
@@ -345,7 +349,7 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 					reply.Success = false
 					break
 				}
-				if reply.Success { // success
+				if reply.Success && reply.Term == thisTerm { // success
 					if next < logEnd { // if not heart beat
 						rf.mu.Lock()
 						if rf.nextIndex[serverId] < logEnd-1 { // update next index and match index
@@ -367,7 +371,7 @@ func (rf *Raft) sendAppendEntries() { // if majority accept, update the commitId
 				}
 			}
 			appendResult <- reply.Success
-		}(i, updateEnd)
+		}(i)
 	}
 
 	// wait for result
