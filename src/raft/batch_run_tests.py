@@ -13,8 +13,7 @@ import subprocess
 from tqdm import tqdm
 
 
-def work():
-    cmd = ['go', 'test', '-race']
+def work(cmd):
     fail_str = "FAIL"
     pass_str = "PASS"
 
@@ -32,14 +31,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-j", "--jobs", type=int, default=multiprocessing.cpu_count() * 2, help="process jobs")
     parser.add_argument("-t", "--total", type=int, default=1000, help="total test times")
+    parser.add_argument("-r", "--run", default="", help="run the special test cases")
     parser.add_argument("-v", action='store_true', help="print the fail information")
     opt = parser.parse_args()
+    
     total = opt.total
+    command = ['go', 'test', '-race']
+    if opt.run != "":
+        command.append("-run")
+        command.append(opt.run)
 
+    print("run command = ", command)
     print("run with process pool, poll size =", opt.jobs, ", tasks =", total)
     pool = multiprocessing.Pool(processes=opt.jobs)
 
-    res = [pool.apply_async(work) for i in range(total)]
+    res = [pool.apply_async(work, args=(command,)) for i in range(total)]
     pool.close()
     result = [i.get() for i in tqdm(res)]
     pool.join()
